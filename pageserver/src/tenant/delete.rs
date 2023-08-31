@@ -72,9 +72,9 @@ async fn create_remote_delete_mark(
 ) -> Result<(), DeleteTenantError> {
     let remote_mark_path = remote_tenant_delete_mark_path(conf, tenant_id)?;
 
-    let data: &[u8] = &[];
     backoff::retry(
         || async {
+            let data = std::io::Cursor::new(vec![]);
             remote_storage
                 .upload(data, 0, &remote_mark_path, None)
                 .await

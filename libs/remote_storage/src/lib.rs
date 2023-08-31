@@ -8,6 +8,7 @@
 mod local_fs;
 mod s3_bucket;
 mod simulate_failures;
+mod azure;
 
 use std::{
     collections::HashMap,
@@ -25,6 +26,9 @@ use toml_edit::Item;
 use tracing::info;
 
 pub use self::{local_fs::LocalFs, s3_bucket::S3Bucket, simulate_failures::UnreliableWrapper};
+
+#[cfg(feature = "azure")]
+use self::azure::AzureStorage;
 
 /// How many different timelines can be processed simultaneously when synchronizing layers with the remote storage.
 /// During regular work, pageserver produces one layer file per timeline checkpoint, with bursts of concurrency
@@ -120,7 +124,7 @@ pub trait RemoteStorage: Send + Sync + 'static {
     /// Streams the local file contents into remote into the remote storage entry.
     async fn upload(
         &self,
-        from: impl io::AsyncRead + Unpin + Send + Sync + 'static,
+        from: impl io::AsyncRead + io::AsyncSeek + Unpin + Send + Sync + 'static,
         // S3 PUT request requires the content length to be specified,
         // otherwise it starts to fail with the concurrent connection count increasing.
         data_size_bytes: usize,
@@ -190,6 +194,8 @@ impl std::error::Error for DownloadError {}
 pub enum GenericRemoteStorage {
     LocalFs(LocalFs),
     AwsS3(Arc<S3Bucket>),
+    #[cfg(feature = "azure")]
+    Azure(AzureStorage),
     Unreliable(Arc<UnreliableWrapper>),
 }
 
@@ -202,6 +208,8 @@ impl GenericRemoteStorage {
             Self::LocalFs(s) => s.list_files(folder).await,
             Self::AwsS3(s) => s.list_files(folder).await,
             Self::Unreliable(s) => s.list_files(folder).await,
+            #[cfg(feature = "azure")]
+            Self::Azure(s) => s.list_files(folder).await,
         }
     }
 
@@ -215,13 +223,15 @@ impl GenericRemoteStorage {
         match self {
             Self::LocalFs(s) => s.list_prefixes(prefix).await,
             Self::AwsS3(s) => s.list_prefixes(prefix).await,
+            #[cfg(feature = "azure")]
+            Self::Azure(s) => s.list_prefixes(prefix).await,
             Self::Unreliable(s) => s.list_prefixes(prefix).await,
         }
     }
 
     pub async fn upload(
         &self,
-        from: impl io::AsyncRead + Unpin + Send + Sync + 'static,
+        from: impl io::AsyncRead + tokio::io::AsyncSeek + Unpin + Send + Sync + 'static,
         data_size_bytes: usize,
         to: &RemotePath,
         metadata: Option<StorageMetadata>,
@@ -229,6 +239,8 @@ impl GenericRemoteStorage {
         match self {
             Self::LocalFs(s) => s.upload(from, data_size_bytes, to, metadata).await,
             Self::AwsS3(s) => s.upload(from, data_size_bytes, to, metadata).await,
+            #[cfg(feature = "azure")]
+            Self::Azure(s) => s.upload(from, data_size_bytes, to, metadata).await,
             Self::Unreliable(s) => s.upload(from, data_size_bytes, to, metadata).await,
         }
     }
@@ -237,6 +249,8 @@ impl GenericRemoteStorage {
         match self {
             Self::LocalFs(s) => s.download(from).await,
             Self::AwsS3(s) => s.download(from).await,
+            #[cfg(feature = "azure")]
+            Self::Azure(s) => s.download(from).await,
             Self::Unreliable(s) => s.download(from).await,
         }
     }
@@ -256,6 +270,11 @@ impl GenericRemoteStorage {
                 s.download_byte_range(from, start_inclusive, end_exclusive)
                     .await
             }
+            #[cfg(feature = "azure")]
+            Self::Azure(s) => {
+                s.download_byte_range(from, start_inclusive, end_exclusive)
+                    .await
+            }
             Self::Unreliable(s) => {
                 s.download_byte_range(from, start_inclusive, end_exclusive)
                     .await
@@ -267,6 +286,8 @@ impl GenericRemoteStorage {
         match self {
             Self::LocalFs(s) => s.delete(path).await,
             Self::AwsS3(s) => s.delete(path).await,
+            #[cfg(feature = "azure")]
+            Self::Azure(s) => s.delete(path).await,
             Self::Unreliable(s) => s.delete(path).await,
         }
     }
@@ -275,6 +296,8 @@ impl GenericRemoteStorage {
         match self {
             Self::LocalFs(s) => s.delete_objects(paths).await,
             Self::AwsS3(s) => s.delete_objects(paths).await,
+            #[cfg(feature = "azure")]
+            Self::Azure(s) => s.delete_objects(paths).await,
             Self::Unreliable(s) => s.delete_objects(paths).await,
         }
     }
@@ -306,7 +329,7 @@ impl GenericRemoteStorage {
     /// this path is used for the remote object id conversion only.
     pub async fn upload_storage_object(
         &self,
-        from: impl tokio::io::AsyncRead + Unpin + Send + Sync + 'static,
+        from: impl tokio::io::AsyncRead + tokio::io::AsyncSeek + Unpin + Send + Sync + 'static,
         from_size_bytes: usize,
         to: &RemotePath,
     ) -> anyhow::Result<()> {
