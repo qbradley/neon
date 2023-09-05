@@ -8,6 +8,7 @@
 mod local_fs;
 mod s3_bucket;
 mod simulate_failures;
+#[cfg(feature = "azure")]
 mod azure;
 
 use std::{
@@ -25,7 +26,7 @@ use tokio::io;
 use toml_edit::Item;
 use tracing::info;
 
-pub use self::{local_fs::LocalFs, s3_bucket::S3Bucket, simulate_failures::UnreliableWrapper};
+use self::{local_fs::LocalFs, s3_bucket::S3Bucket, simulate_failures::UnreliableWrapper};
 
 #[cfg(feature = "azure")]
 use self::azure::AzureStorage;
