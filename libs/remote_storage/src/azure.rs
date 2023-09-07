@@ -1,7 +1,8 @@
 use std::{sync::{Arc, Mutex}, ops::DerefMut, task::Poll};
 
-use anyhow::{bail, anyhow};
-use azure_storage_blobs::{prelude::{BlobClient, ContainerClient}, blob::operations::{GetBlobResponse, GetBlobBuilder}};
+use anyhow::{anyhow, Context};
+use azure_storage::ConnectionString;
+use azure_storage_blobs::{prelude::{BlobClient, ContainerClient, ClientBuilder}, blob::operations::{GetBlobResponse, GetBlobBuilder}};
 use futures_io::SeekFrom;
 use tokio::{io::ReadBuf, pin};
 use tokio_stream::StreamExt;
@@ -15,6 +16,7 @@ use crate::{RemoteStorage, RemotePath, DownloadError, StorageMetadata, Download}
 #[derive(Clone)]
 pub struct AzureStorage {
     container_client: ContainerClient,
+    prefix_in_container: String,
 }
 
 #[cfg(feature = "azure")]
@@ -22,7 +24,25 @@ impl AzureStorage {
     pub fn new() -> anyhow::Result<Self> {
         debug!("Creating azure remote storage");
 
-        bail!("fail blog")
+        let connection_string = std::env::var("AZURE_CONNECTION_STRING").context("AZURE_CONNECTION_STRING environment variable not set")?;
+        let container_name = std::env::var("AZURE_CONTAINER").context("AZURE_CONTAINER environment variable not set")?;
+        let mut prefix_in_container = std::env::var("AZURE_PREFIX_IN_CONTAINER").context("AZURE_PREFIX_IN_CONTAINER environment variable not set")?;
+        let connection_string = ConnectionString::new(&connection_string)?;
+        let storage_credentials= connection_string.storage_credentials()?;
+        let account_name =
+            connection_string
+            .account_name
+            .ok_or(anyhow!("Connection string does not contain AccountName"))?;
+        let container_client = ClientBuilder::new(account_name, storage_credentials).container_client(container_name);
+
+        while prefix_in_container.ends_with("/") {
+            prefix_in_container.pop();
+        }
+
+        Ok(Self {
+            container_client: container_client,
+            prefix_in_container: prefix_in_container + "/",
+        })
     }
 
     pub fn get_client(&self, path: &RemotePath) -> BlobClient {
@@ -106,30 +126,32 @@ impl<S> futures_io::AsyncRead for StreamWrapper<S> where S : tokio::io::AsyncRea
         buf: &mut [u8],
     ) -> std::task::Poll<futures_io::Result<usize>> {
         let this = self.project();
-        let mut read_buf = ReadBuf::new(buf);
         let mut stream = this.stream.lock().unwrap();
-        let stream = stream.deref_mut();
-        let stream = std::pin::Pin::new(stream);
-        match this.state {
-            StreamWrapperState::Start =>
-                match tokio::io::AsyncRead::poll_read(stream, cx, &mut read_buf) {
-                    Poll::Ready(_) => Poll::Ready(Ok(read_buf.filled().len())),
-                    Poll::Pending => Poll::Pending,
+        loop {
+            let pinned_stream = std::pin::Pin::new(stream.deref_mut());
+            match this.state {
+                 StreamWrapperState::Start => {
+                    let mut read_buf = ReadBuf::new(buf);
+                    match tokio::io::AsyncRead::poll_read(pinned_stream, cx, &mut read_buf) {
+                        Poll::Ready(_) => return Poll::Ready(Ok(read_buf.filled().len())),
+                        Poll::Pending => return Poll::Pending,
+                    }
                 },
-            StreamWrapperState::NeedsReset => {
-                match tokio::io::AsyncSeek::start_seek(stream, SeekFrom::Start(0)) {
-                    Ok(()) => {
-                        *this.state = StreamWrapperState::Resetting;
-                        Poll::Pending
-                    },
-                    Err(e) => Poll::Ready(Err(futures_io::Error::new(std::io::ErrorKind::Other, e)))
+                StreamWrapperState::NeedsReset => {
+                    match tokio::io::AsyncSeek::start_seek(pinned_stream, SeekFrom::Start(0)) {
+                        Ok(()) => {
+                            *this.state = StreamWrapperState::Resetting;
+                        },
+                        Err(e) => return Poll::Ready(Err(futures_io::Error::new(std::io::ErrorKind::Other, e)))
+                    }
+                },
+                StreamWrapperState::Resetting => {
+                    if let Poll::Ready(_) = tokio::io::AsyncSeek::poll_complete(pinned_stream, cx) {
+                        *this.state = StreamWrapperState::Start;
+                    } else {
+                        return Poll::Pending;
+                    }
                 }
-            },
-            StreamWrapperState::Resetting => {
-                if let Poll::Ready(_) = tokio::io::AsyncSeek::poll_complete(stream, cx) {
-                    *this.state = StreamWrapperState::Start;
-                }
-                Poll::Pending
             }
         }
     }
@@ -169,20 +191,23 @@ impl RemoteStorage for AzureStorage {
         &self,
         prefix: Option<&RemotePath>,
     ) -> Result<Vec<RemotePath>, DownloadError> {
-        let mut blobs =
+        let prefix = self.prefix_in_container.clone() + &prefix.map(|path| path.to_string()).unwrap_or(String::new());
+        //eprintln!("list_prefixes({:?})", prefix);
+        let blobs =
             self.container_client
                 .list_blobs()
-                .delimiter("/");
-        if let Some(prefix) = prefix {
-            blobs = blobs.prefix(prefix.to_string());
-        }
+                .delimiter("/")
+                .prefix(prefix);
         let mut blob_stream = blobs.into_stream();
         
         let mut results: Vec<RemotePath> = Vec::new();
         while let Some(item) = blob_stream.next().await {
             if let Ok(list) = item {
                 for blob_prefix in list.blobs.prefixes() {
-                    results.push(RemotePath::from_string(&blob_prefix.name).map_err(DownloadError::Other)?);
+                    //eprintln!("Name {:?} prefix_in_container {:?}", &blob_prefix.name, &self.prefix_in_container);
+                    let name = (&blob_prefix.name).strip_prefix(&self.prefix_in_container).unwrap().strip_suffix("/").unwrap();
+                    //eprintln!("Result {:?}", name);
+                    results.push(RemotePath::from_string(name).map_err(DownloadError::Other)?);
                 }
             }
         }
@@ -192,10 +217,8 @@ impl RemoteStorage for AzureStorage {
 
     /// See the doc for `RemoteStorage::list_files`
     async fn list_files(&self, folder: Option<&RemotePath>) -> anyhow::Result<Vec<RemotePath>> {
-        let mut blobs = self.container_client.list_blobs();
-        if let Some(prefix) = folder {
-            blobs = blobs.prefix(prefix.to_string());
-        }
+        let prefix = self.prefix_in_container.clone() + &folder.map(|path| path.to_string()).unwrap_or(String::new());
+        let blobs = self.container_client.list_blobs().prefix(prefix);
         let mut blob_stream = blobs.into_stream();
         
         let mut results: Vec<RemotePath> = Vec::new();
@@ -217,7 +240,7 @@ impl RemoteStorage for AzureStorage {
         to: &RemotePath,
         _metadata: Option<StorageMetadata>,
     ) -> anyhow::Result<()> {
-        let blob_name = to.to_string();
+        let blob_name = self.prefix_in_container.clone() + &to.to_string();
         let client = self.container_client.blob_client(blob_name);
         let body = azure_core::Body::SeekableStream(Box::new(StreamWrapper::new(from, from_size_bytes)));
         match client.put_block_blob(body).await {
@@ -227,7 +250,7 @@ impl RemoteStorage for AzureStorage {
     }
 
     async fn download(&self, from: &RemotePath) -> Result<Download, DownloadError> {
-        let blob_name = from.to_string();
+        let blob_name = self.prefix_in_container.clone() + &from.to_string();
         let client = self.container_client.blob_client(blob_name);
         let blob = client.get();
         self.download_stream(blob).await
@@ -239,7 +262,7 @@ impl RemoteStorage for AzureStorage {
         start_inclusive: u64,
         end_exclusive: Option<u64>,
     ) -> Result<Download, DownloadError> {
-        let blob_name = from.to_string();
+        let blob_name = self.prefix_in_container.clone() + &from.to_string();
         let client = self.container_client.blob_client(blob_name);
         let blob = client.get();
         let end = match end_exclusive {
@@ -258,7 +281,7 @@ impl RemoteStorage for AzureStorage {
     }
 
     async fn delete(&self, path: &RemotePath) -> anyhow::Result<()> {
-        let blob_name = path.to_string();
+        let blob_name = self.prefix_in_container.clone() + &path.to_string();
         let client = self.container_client.blob_client(blob_name);
         client.delete().await?;
         Ok(())

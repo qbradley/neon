@@ -316,6 +316,10 @@ impl GenericRemoteStorage {
                       s3_config.bucket_name, s3_config.bucket_region, s3_config.prefix_in_bucket, s3_config.endpoint);
                 Self::AwsS3(Arc::new(S3Bucket::new(s3_config)?))
             }
+            RemoteStorageKind::Azure() => {
+                info!("Using azure as a remote storage");
+                Self::Azure(AzureStorage::new()?)
+            }
         })
     }
 
@@ -380,6 +384,8 @@ pub enum RemoteStorageKind {
     /// AWS S3 based storage, storing all files in the S3 bucket
     /// specified by the config
     AwsS3(S3Config),
+    #[cfg(feature = "azure")]
+    Azure(),
 }
 
 /// AWS S3 bucket coordinates and access credentials to manage the bucket contents (read and write).
